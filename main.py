@@ -2,84 +2,46 @@ from __future__ import unicode_literals
 
 import asyncio
 import os
-import subprocess
 import traceback
-from sys import version as pyver
-import urllib.request
 
-from langdetect import detect
-from langdetect import detect_langs
-from langdetect import DetectorFactory
-from wordfilter import Wordfilter
+import pytgcalls
+from pyrogram import filters, idle
+from pyrogram.errors.exceptions.bad_request_400 import \
+    ChatAdminRequired
+from pyrogram.raw.functions.phone import CreateGroupCall
+from pyrogram.raw.types import InputPeerChannel
+from pyrogram.types import Message
 
-import youtube_dl
-from pyrogram import Client, filters, idle
-from pytgcalls import GroupCall
-from Python_ARQ import ARQ
+# Initialize db
+import db
 
-from functions import (convert_seconds, download_and_transcode_song,
-                       generate_cover, generate_cover_square, time_to_seconds,
-                       transcode)
-from misc import HELP_TEXT, REPO_TEXT, START_TEXT
+db.init()
 
-# TODO Make it look less messed up
-is_config = os.path.exists("config.py")
+from db import db
+from functions import (CHAT_ID, app, get_default_service, play_song,
+                       session, telegram, BITRATE)
+from misc import HELP_TEXT, REPO_TEXT
 
-if is_config:
-    from config import *
-else:
-    from sample_config import *
-
-if HEROKU:
-    if is_config:
-        from config import SESSION_STRING
-    elif not is_config:
-        from sample_config import SESSION_STRING
-
-queue = []  # This is where the whole song queue is stored
-playing = False  # Tells if something is playing or not
-call = {}
-
-# Pyrogram Client
-if not HEROKU:
-    app = Client("tgvc", api_id=API_ID, api_hash=API_HASH)
-else:
-    app = Client(SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
-
-# Pytgcalls Client
-
-
-# Arq Client
-arq = ARQ(ARQ_API, ARQ_API_KEY)
-
-
-async def delete(message):
-    await asyncio.sleep(10)
-    await message.delete()
+running = False  # Tells if the queue is running or not
+CLIENT_TYPE = pytgcalls.GroupCallFactory.MTPROTO_CLIENT_TYPE.PYROGRAM
+PLAYOUT_FILE = "input.raw"
+PLAY_LOCK = asyncio.Lock()
+OUTGOING_AUDIO_BITRATE_KBIT = BITRATE
 
 
 @app.on_message(
-    filters.command("start")
+    filters.command("help") 
     & ~filters.private
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
-)
-async def start(_, message):
-    await message.reply_text(START_TEXT, quote=False)
-
-
-@app.on_message(
-    filters.command("help")
-    & ~filters.private
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
+    & filters.chat(CHAT_ID)
 )
 async def help(_, message):
     await message.reply_text(HELP_TEXT, quote=False)
 
 
 @app.on_message(
-    filters.command("repo")
+    filters.command("repo") 
     & ~filters.private
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
+    & filters.chat(CHAT_ID)
 )
 async def repo(_, message):
     await message.reply_text(REPO_TEXT, quote=False)
@@ -87,513 +49,341 @@ async def repo(_, message):
 
 @app.on_message(
     filters.command("joinvc")
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
     & ~filters.private
+    & filters.chat(CHAT_ID)
 )
-async def joinvc(_, message):
-    global call
-    chat_id = message.chat.id
-    try:
-        if str(chat_id) in call.keys():
-            await message.reply_text("__**Bot Is Already In The VC**__", quote=False)
-            return
-        vc = GroupCall(
-            client=app,
-            input_filename=f"input.raw",
-            play_on_repeat=True,
-            enable_logs_to_console=False,
+async def joinvc(_, message, manual=False):
+    if "call" in db:
+        return await message.reply_text(
+            "__**Bot Is Already In The VC**__"
         )
-        await vc.start(chat_id)
-        call[str(chat_id)] = vc
-        await message.reply_text("__**Joined The Voice Chat.**__", quote=False)
-    except Exception as e:
-        e = traceback.format_exc
-        print(str(e))
+    os.popen(f"cp etc/sample_input.raw {PLAYOUT_FILE}")
+    vc = pytgcalls.GroupCallFactory(
+        app, CLIENT_TYPE, OUTGOING_AUDIO_BITRATE_KBIT
+    ).get_file_group_call(PLAYOUT_FILE)
+    db["call"] = vc
+    try:
+        await vc.start(CHAT_ID)
+    except Exception:
+        peer = await app.resolve_peer(CHAT_ID)
+        startVC = CreateGroupCall(
+            peer=InputPeerChannel(
+                channel_id=peer.channel_id,
+                access_hash=peer.access_hash,
+            ),
+            random_id=app.rnd_id() // 9000000000,
+        )
+        try:
+            await app.send(startVC)
+            await vc.start(CHAT_ID)
+        except ChatAdminRequired:
+            del db["call"]
+            return await message.reply_text(
+                "Make me admin with message delete and vc manage permission"
+            )
+    await message.reply_text(
+        "__**Joined The Voice Chat.**__ \n\n**Note:** __If you can't hear anything,"
+        + " Send /leavevc and then /joinvc again.__"
+    )
+    await message.delete()
 
 
-@app.on_message(filters.command("leavevc") & filters.user(SUDOERS) & ~filters.private)
+@app.on_message(
+    filters.command("leavevc")
+    & ~filters.private
+    & filters.chat(CHAT_ID)
+)
 async def leavevc(_, message):
-    vc = call[str(message.chat.id)]
-    await vc.leave_current_group_call()
-    await vc.stop()
-    await message.reply_text(
-        "__**Left The Voice Chat, Restarting Client....**__", quote=False
-    )
-    os.execvp(
-        f"python{str(pyver.split(' ')[0])[:3]}",
-        [f"python{str(pyver.split(' ')[0])[:3]}", "main.py"],
-    )
+    if "call" in db:
+        await db["call"].leave_current_group_call()
+        await db["call"].stop()
+        del db["call"]
+    await message.reply_text("__**Left The Voice Chat**__")
+    await message.delete()
 
 
-@app.on_message(filters.command("update") & filters.user(SUDOERS) & ~filters.private)
-async def update_restart(_, message):
-    await message.reply_text(
-        f'```{subprocess.check_output(["git", "pull"]).decode("UTF-8")}```', quote=False
-    )
-    os.execvp(
-        f"python{str(pyver.split(' ')[0])[:3]}",
-        [f"python{str(pyver.split(' ')[0])[:3]}", "main.py"],
-    )
+@app.on_message(
+    filters.command("volume")
+    & ~filters.private
+    & filters.chat(CHAT_ID)
+)
+async def volume_bot(_, message):
+    usage = "**Usage:**\n/volume [1-200]"
+    if len(message.command) != 2:
+        return await message.reply_text(usage)
+    if "call" not in db:
+        return await message.reply_text("VC isn't started")
+    vc = db["call"]
+    volume = int(message.text.split(None, 1)[1])
+    if (volume < 1) or (volume > 200):
+        return await message.reply_text(usage)
+    try:
+        await vc.set_my_volume(volume=volume)
+    except ValueError:
+        return await message.reply_text(usage)
+    await message.reply_text(f"**Volume Set To {volume}**")
 
 
 @app.on_message(
     filters.command("pause")
     & ~filters.private
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
+    & filters.chat(CHAT_ID)
 )
-async def pause_song(_, message):
-    vc = call[str(message.chat.id)]
-    vc.pause_playout()
+async def pause_song_func(_, message):
+    if "call" not in db:
+        return await message.reply_text("**VC isn't started**")
+    if "paused" in db:
+        if db.get("paused"):
+            return await message.reply_text("**Already paused**")
+    db["paused"] = True
+    db["call"].pause_playout()
     await message.reply_text(
-        "**Paused The Music, Send `/resume` To Resume.**", quote=False
+        "**Paused The Music, Send `/resume` To Resume.**"
     )
 
 
 @app.on_message(
     filters.command("resume")
     & ~filters.private
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
+    & filters.chat(CHAT_ID)
 )
 async def resume_song(_, message):
-    vc = call[str(message.chat.id)]
-    vc.resume_playout()
+    if "call" not in db:
+        return await message.reply_text("**VC isn't started**")
+    if "paused" in db:
+        if not db.get("paused"):
+            return await message.reply_text("**Already playing**")
+    db["paused"] = False
+    db["call"].resume_playout()
     await message.reply_text(
-        "**Resumed, Send `/pause` To Pause The Music.**", quote=False
+        "**Resumed, Send `/pause` To Pause The Music.**"
     )
 
 
 @app.on_message(
-    filters.command("volume")
-    & ~filters.private
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
+    filters.command("skip") & ~filters.private & filters.chat(CHAT_ID)
 )
-async def volume_bot(_, message):
-    vc = call[str(message.chat.id)]
-    usage = "**Usage:**\n/volume [1-200]"
-    if len(message.command) != 2:
-        await message.reply_text(usage, quote=False)
-        return
-    volume = int(message.text.split(None, 1)[1])
-    if (volume < 1) or (volume > 200):
-        await message.reply_text(usage, quote=False)
-        return
-    try:
-        await vc.set_my_volume(volume=volume)
-    except ValueError:
-        await message.reply_text(usage, quote=False)
-        return
-    await message.reply_text(f"**Volume Set To {volume}**", quote=False)
+async def skip_func(_, message):
+    if "queue" not in db:
+        await message.reply_text("**VC isn't started**")
+        return await message.delete()
+    queue = db["queue"]
+    if queue.empty() and ("playlist" not in db or not db["playlist"]):
+        await message.reply_text(
+            "__**Queue Is Empty, Just Like Your Life.**__"
+        )
+        return await message.delete()
+    db["skipped"] = True
+    await message.reply_text("__**Skipped!**__")
+    await message.delete()
+
 
 
 @app.on_message(
-    filters.command("play")
-    & ~filters.private
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
+    filters.command("play") & ~filters.private & filters.chat(CHAT_ID)
 )
 async def queuer(_, message):
-    global queue
+    global running
     try:
-        usage = "**Usage:**\n__**/play youtube/saavn/deezer Song_Name**__"
-        if len(message.command) < 3:
-            await message.reply_text(usage, quote=False)
-            return
-        text = message.text.split(None, 2)[1:]
-        service = text[0].lower()
-        song_name = text[1]
-        requested_by = message.from_user.first_name
-        services = ["youtube", "deezer", "saavn"]
-        if service not in services:
-            await message.reply_text(usage, quote=False)
-            return
-        await message.delete()
-        if len(queue) > 0:
-            await message.reply_text("__**Added To Queue.__**", quote=False)
-        queue.append(
-            {
-                "service": service,
-                "song": song_name,
-                "requested_by": requested_by,
-                "message": message,
-            }
-        )
-        await play()
+        usage = """
+**Usage:**
+__/play Song_Name__
+__/play youtube/saavn Song_Name__
+__/play Reply_On_Audio__"""
+
+        async with PLAY_LOCK:
+            if (
+                len(message.command) < 2
+                and not message.reply_to_message
+            ):
+                return await message.reply_text(usage)
+            if "call" not in db:
+                return await message.reply_text(
+                    "**Use /joinvc First!**"
+                )
+            if message.reply_to_message:
+                if message.reply_to_message.audio:
+                    service = "telegram"
+                    song_name = message.reply_to_message.audio.title
+                else:
+                    return await message.reply_text(
+                        "**Reply to a telegram audio file**"
+                    )
+            else:
+                text = message.text.split("\n")[0]
+                text = text.split(None, 2)[1:]
+                service = text[0].lower()
+                services = ["youtube", "saavn"]
+                if service in services:
+                    song_name = text[1]
+                else:
+                    service = get_default_service()
+                    song_name = " ".join(text)
+                if "http" in song_name or ".com" in song_name:
+                    return await message.reply("Links aren't supported.")
+
+            requested_by = message.from_user.first_name
+            if "queue" not in db:
+                db["queue"] = asyncio.Queue()
+            if not db["queue"].empty() or db.get("running"):
+                await message.reply_text("__**Added To Queue.__**")
+
+            await db["queue"].put(
+                {
+                    "service": service or telegram,
+                    "requested_by": requested_by,
+                    "query": song_name,
+                    "message": message,
+                }
+            )
+        if not db.get("running"):
+            db["running"] = True
+            await start_queue()
     except Exception as e:
+        await message.reply_text(str(e))
         e = traceback.format_exc()
         print(e)
-        await message.reply_text(str(e), quote=False)
-
-
-@app.on_message(filters.command("skip") & ~filters.private & filters.user(SUDOERS))
-async def skip(_, message):
-    global playing
-    if len(queue) == 0:
-        await message.reply_text(
-            "__**Queue Is Empty, Just Like Your Life.**__", quote=False
-        )
-        return
-    playing = False
-    await message.reply_text("__**Skipped!**__", quote=False)
-    await play()
 
 
 @app.on_message(
     filters.command("queue")
     & ~filters.private
-    & (filters.user(SUDOERS) | filters.chat(SUDO_CHAT_ID))
+    & filters.chat(CHAT_ID)
 )
 async def queue_list(_, message):
-    if len(queue) != 0:
-        i = 1
-        text = ""
-        for song in queue:
-            text += (
-                f"**{i}. Platform:** __**{song['service']}**__ "
-                + f"| **Song:** __**{song['song']}**__\n"
-            )
-            i += 1
-        m = await message.reply_text(text, quote=False)
-        await delete(message)
-        await m.delete()
-
-    else:
-        m = await message.reply_text(
-            "__**Queue Is Empty, Just Like Your Life.**__", quote=False
+    if "queue" not in db:
+        db["queue"] = asyncio.Queue()
+    queue = db["queue"]
+    if queue.empty():
+        return await message.reply_text(
+            "__**Queue Is Empty, Just Like Your Life.**__"
         )
-        await delete(message)
-        await m.delete()
+    if (
+        len(message.text.split()) > 1
+        and message.text.split()[1].lower() == "plformat"
+    ):
+        pl_format = True
+    else:
+        pl_format = False
+    text = ""
+    for count, song in enumerate(queue._queue, 1):
+        if not pl_format:
+            text += (
+                f"**{count}. {song['service']}** "
+                + f"| __{song['query']}__  |  {song['requested_by']}\n"
+            )
+        else:
+            text += song["query"] + "\n"
+    if len(text) > 4090:
+        return await message.reply_text(
+            f"**There are {queue.qsize()} songs in queue.**"
+        )
+    await message.reply_text(text)
 
 
 # Queue handler
 
 
-async def play():
-    global queue, playing
-    while not playing:
-        await asyncio.sleep(0.1)
-        if len(queue) != 0:
-            service = queue[0]["service"]
-            song = queue[0]["song"]
-            requested_by = queue[0]["requested_by"]
-            message = queue[0]["message"]
-            if service == "youtube":
-                playing = True
-                del queue[0]
-                try:
-                    await ytplay(requested_by, song, message)
-                except Exception as e:
-                    print(str(e))
-                    playing = False
-                    pass
-            elif service == "saavn":
-                playing = True
-                del queue[0]
-                try:
-                    await jiosaavn(requested_by, song, message)
-                except Exception as e:
-                    print(str(e))
-                    playing = False
-                    pass
-            elif service == "deezer":
-                playing = True
-                del queue[0]
-                try:
-                    await deezer(requested_by, song, message)
-                except Exception as e:
-                    print(str(e))
-                    playing = False
-                    pass
-
-
-# Deezer----------------------------------------------------------------------------------------
-
-
-async def deezer(requested_by, query, message):
-    global playing
-    m = await message.reply_text(
-        f"__**Searching for {query} on Deezer.**__", quote=False
-    )
-    try:
-        songs = await arq.deezer(query, 1)
-        if not songs.ok:
-            await message.reply_text(songs.result)
-            return
-        songs = songs.result
-        title = songs[0].title
-        duration = convert_seconds(int(songs[0].duration))
-        thumbnail = songs[0].thumbnail
-        artist = songs[0].artist
-        url = songs[0].url
-    except Exception:
-        await m.edit("__**Found No Song Matching Your Query.**__")
-        playing = False
-        return
-    await m.edit("__**Generating Thumbnail.**__")
-    await generate_cover_square(requested_by, title, artist, duration, thumbnail)
-    await m.edit("__**Downloading And Transcoding.**__")
-    await download_and_transcode_song(url)
-    await m.delete()
-    caption = (
-        f"🏷 **Name:** [{title[:35]}]({url})\n⏳ **Duration:** {duration}\n"
-        + f"🎧 **Requested By:** {message.from_user.mention}\n📡 **Platform:** Deezer"
-    )
-    m = await message.reply_photo(
-        photo="final.png",
-        caption=caption,
-    )
-    os.remove("final.png")
-    await asyncio.sleep(int(songs[0]["duration"]))
-    await m.delete()
-    playing = False
-
-
-# Jiosaavn--------------------------------------------------------------------------------------
-
-
-async def jiosaavn(requested_by, query, message):
-    global playing
-    m = await message.reply_text(
-        f"__**Searching for {query} on JioSaavn.**__", quote=False
-    )
-    try:
-        songs = await arq.saavn(query)
-        if not songs.ok:
-            await message.reply_text(songs.result)
-            return
-        songs = songs.result
-        sname = songs[0].song
-        slink = songs[0].media_url
-        ssingers = songs[0].singers
-        sthumb = songs[0].image
-        sduration = songs[0].duration
-        sduration_converted = convert_seconds(int(sduration))
-    except Exception as e:
-        await m.edit("__**Found No Song Matching Your Query.**__")
-        print(str(e))
-        playing = False
-        return
-    await m.edit("__**Processing Thumbnail.**__")
-    await generate_cover_square(
-        requested_by, sname, ssingers, sduration_converted, sthumb
-    )
-    await m.edit("__**Downloading And Transcoding.**__")
-    await download_and_transcode_song(slink)
-    await m.delete()
-    caption = (
-        f"🏷 **Name:** {sname[:35]}\n⏳ **Duration:** {sduration_converted}\n"
-        + f"🎧 **Requested By:** {message.from_user.mention}\n📡 **Platform:** JioSaavn"
-    )
-    m = await message.reply_photo(
-        photo="final.png",
-        caption=caption,
-    )
-    os.remove("final.png")
-    await asyncio.sleep(int(sduration))
-    await m.delete()
-    playing = False
-
-
-# Youtube Play-----------------------------------------------------
-
-
-async def ytplay(requested_by, query, message):
-    global playing
-    ydl_opts = {"format": "bestaudio"}
-    m = await message.reply_text(
-        f"__**Searching for {query} on YouTube.**__", quote=False
-    )
-    try:
-        results = await arq.youtube(query)
-        if not results.ok:
-            await message.reply_text(results.result)
-            return
-        results = results.result
-        link = f"https://youtube.com{results[0].url_suffix}"
-        title = results[0].title
-        thumbnail = results[0].thumbnails[0]
-        duration = results[0].duration
-        views = results[0].views
-         
-         
-         
-         
-        songname = title.lower()
-        detecting = detect(songname)
-         
-        wordfilter = Wordfilter()
-        wordfilter.addWords(['yamete', 'kudasai', 'arigato', 'hentai'])     
-        if wordfilter.blacklisted(songname): 
-           await m.edit("__**Not allowed song !!!**__")  
-           playing = False
-           return
-        if detecting == "ko":
-           await m.edit("__**Not allowed Language !!!**__")  
-           playing = False
-           return
-         
-         
-         
-        if time_to_seconds(duration) >= 1800:
-            await m.edit("__**Bruh! Only songs within 30 Mins.**__")
-            playing = False
-            return
-    except Exception as e:
-        await m.edit("__**Found No Song Matching Your Query.**__")
-        playing = False
-        print(str(e))
-        return
-    await m.edit("__**Processing Thumbnail.**__")
-    await app.update_profile(first_name=f"🔉{title[:35]} ",bio = f"__{title[:35]}__ ijro etilmoqda")     
-    await generate_cover(requested_by, title, views, duration, thumbnail)
-    await m.edit("__**Downloading Music.**__")
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(link, download=False)
-        audio_file = ydl.prepare_filename(info_dict)
-        ydl.process_info(info_dict)
-    await m.edit("__**Transcoding.**__")
-    os.rename(audio_file, "audio.webm")
-    transcode("audio.webm")
-    await m.delete()
-    caption = f"🏷 **Name:** [{title[:35]}]({link})\n⏳ **Duration:** {duration}\n" \
-               + f"🎧 **Requested By:** {requested_by}\n📡 **Platform:** YouTube"
-    m = await message.reply_photo(
-        photo="final.png",
-        caption=caption,
-    )
-    msg_id = m.message_id      
-    await app.pin_chat_message(SUDO_CHAT_ID, msg_id, disable_notification=True) 
-         
-    os.remove("final.png")
-    await asyncio.sleep(int(time_to_seconds(duration)))
-    await app.delete_profile_photos([p.file_id for p in photos[1:]])     
-    playing = False
-    await m.delete()
-
-
-# Telegram Audio------------------------------------
+async def start_queue(message=None):
+    while db:
+        if "queue_breaker" in db and db.get("queue_breaker") != 0:
+            db["queue_breaker"] -= 1
+            if db["queue_breaker"] == 0:
+                del db["queue_breaker"]
+            break
+        if db["queue"].empty():
+            if "playlist" not in db or not db["playlist"]:
+                db["running"] = False
+                break
+            else:
+                await playlist(app, message, redirected=True)
+        data = await db["queue"].get()
+        service = data["service"]
+        if service == "telegram":
+            await telegram(data["message"])
+        else:
+            await play_song(
+                data["requested_by"],
+                data["query"],
+                data["message"],
+                service,
+            )
 
 
 @app.on_message(
-    filters.command("telegram") & filters.user(SUDOERS) & ~filters.edited
+    filters.command("delqueue")
+    & ~filters.private
+    & filters.chat(CHAT_ID)
 )
-async def tgplay(_, message):
-    global playing
-    if len(queue) != 0:
-        await message.reply_text(
-            "__**You Can Only Play Telegram Files After The Queue Gets "
-            + "Finished.**__",
-            quote=False,
+async def clear_queue(_, message):
+    global db
+    if "call" not in db:
+        return await message.reply_text("**VC isn't started**")
+    if ("queue" not in db or db["queue"].empty()) and (
+        "playlist" not in db or not db["playlist"]
+    ):
+        return await message.reply_text("**Queue Already is Empty**")
+    db["playlist"] = False
+    db["queue"] = asyncio.Queue()
+    await message.reply_text("**Successfully Cleared the Queue**")
+
+
+@app.on_message(
+    filters.command("playlist")
+    & ~filters.private
+    & filters.chat(CHAT_ID)
+)
+async def playlist(_, message: Message, redirected=False):
+    if message.reply_to_message:
+        raw_playlist = message.reply_to_message.text
+    elif len(message.text) > 9:
+        raw_playlist = message.text[10:]
+    else:
+        usage = """
+**Usage: Same as /play
+Example:
+    __**/playlist song_name1
+    song_name2
+    youtube song_name3**__"""
+
+        return await message.reply_text(usage)
+    if "call" not in db:
+        return await message.reply_text("**Use /joinvc First!**")
+    if "playlist" not in db:
+        db["playlist"] = False
+    if "running" in db and db.get("running"):
+        db["queue_breaker"] = 1
+    db["playlist"] = True
+    db["queue"] = asyncio.Queue()
+    for line in raw_playlist.split("\n"):
+        services = ["youtube", "saavn"]
+        if line.split()[0].lower() in services:
+            service = line.split()[0].lower()
+            song_name = " ".join(line.split()[1:])
+        else:
+            service = "youtube"
+            song_name = line
+        requested_by = message.from_user.first_name
+        await db["queue"].put(
+            {
+                "service": service or telegram,
+                "requested_by": requested_by,
+                "query": song_name,
+                "message": message,
+            }
         )
-        return
-    if not message.reply_to_message:
-        await message.reply_text("__**Reply to an audio.**__", quote=False)
-        return
-    if message.reply_to_message.audio:
-        if int(message.reply_to_message.audio.file_size) >= 104857600:
-            await message.reply_text(
-                "__**Bruh! Only songs within 100 MB.**__", quote=False
-            )
-            playing = False
-            return
-        duration = message.reply_to_message.audio.duration
-         
-        if not duration:
-            await message.reply_text(
-                "__**Only Songs With Duration Are Supported.**__", quote=False
-            )
-            return
-        m = await message.reply_text("__**Downloading.**__", quote=False)
-        song = await message.reply_to_message.download()
-        song_name = message.reply_to_message.audio.title 
-        await app.update_profile(first_name=f"🔉{song_name[:35]} ",bio = f"__{song_name[:35]}__ ijro etilmoqda") 
-        await m.edit("__**Transcoding.**__")
-        transcode(song)
-        await m.edit(f"**Playing** __**{message.reply_to_message.link}.**__")
-        await asyncio.sleep(duration)
-        playing = False
-        return
-    await message.reply_text(
-        "__**Only Audio Files (Not Document) Are Supported.**__", quote=False
-    )
-#----------------------------------------#
-     # Delete messages
+    if not redirected:
+        db["running"] = True
+        await message.reply_text("**Playlist Started.**")
+        await start_queue(message)
 
 
-@app.on_message(filters.command("d") & filters.user(SUDOERS))
+async def main():
+    await app.start()
+    print("Bot started!")
+    await idle()
+    await session.close()
 
-async def delete(_, message):
-    if not message.reply_to_message:
-        await message.reply_text("Reply To A Message To Delete It")
-        return
-    try:
-        from_user_id = message.from_user.id
-        chat_id = message.chat.id
-        #permissions = await member_permissions(chat_id, from_user_id)
-        #if "can_delete_messages" in permissions or from_user_id in SUDOERS:
-        await message.reply_to_message.delete()
-        await message.delete()
-        #else:
-            #await message.reply_text("You Don't Have Enough Permissions,"
-                                     #+ " Consider Deleting Yourself!")
-    except Exception as e:
-        await message.reply_text(str(e))
-  #--------------------------------------------#
-@app.on_message(filters.command("cats") & ~filters.edited)
-#@capture_err
-async def cat(_, message):
-    with urllib.request.urlopen(
-            "https://api.thecatapi.com/v1/images/search"
-    ) as url:
-        data = json.loads(url.read().decode())
-    cat_url = (data[0]['url'])
-    await message.reply_photo(cat_url)
-         
-         
-         
-         
-         #---------------#
-@app.on_message(filters.command("block") & filters.user(SUDOERS))
 
-async def delete(_, message):
-    if not message.reply_to_message:
-        await message.reply_text("Reply To A Message To Delete It")
-        return
-    try:
-        from_user_id = message.from_user.id
-        chat_id = message.chat.id
-        #permissions = await member_permissions(chat_id, from_user_id)
-        #if "can_delete_messages" in permissions or from_user_id in SUDOERS:
-        await app.block_user( from_user_id)
-        #await message.reply_to_message.delete()
-        await message.delete()
-        #else:
-            #await message.reply_text("You Don't Have Enough Permissions,"
-                                     #+ " Consider Deleting Yourself!")
-    except Exception as e:
-        await message.reply_text(str(e))
-  #--------------------------------------------#       
-         #---------------#
-@app.on_message(filters.command("unblock") & filters.user(SUDOERS))
-
-async def delete(_, message):
-    if not message.reply_to_message:
-        await message.reply_text("Reply To A Message To Delete It")
-        return
-    try:
-        from_user_id = message.from_user.id
-        chat_id = message.chat.id
-        #permissions = await member_permissions(chat_id, from_user_id)
-        #if "can_delete_messages" in permissions or from_user_id in SUDOERS:
-        await app.unblock_user( from_user_id)
-        #await message.reply_to_message.delete()
-        await message.delete()
-        #else:
-            #await message.reply_text("You Don't Have Enough Permissions,"
-                                     #+ " Consider Deleting Yourself!")
-    except Exception as e:
-        await message.reply_text(str(e))
-  #--------------------------------------------#                
-         
-
-app.start()
-print("\nBot Starting...\nFor Support Join https://t.me/TGVCSUPPORT\n")
-idle()
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
